@@ -1,0 +1,429 @@
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import * as d3 from 'd3';
+import { DataPoint, SERIES_COLORS, SeriesType } from '../types';
+import useLabelPlacements, { HookPlacedLabelInfo } from '../hooks/useLabelPlacements';
+
+// Extend DataPoint to include color property
+interface ExtendedDataPoint extends DataPoint {
+  color?: string;
+}
+
+interface ScatterPlotChartProps {
+  data: DataPoint[];
+  xAxisLabel: string;
+  zAxisLabel: string;
+  visibleSeries?: Set<SeriesType>;
+  backgroundImage?: string;
+  backgroundImageOpacity?: number;
+  backgroundImageScale?: number;
+  axisLabelFontSize?: number;
+  axisTickFontSize?: number;
+  dataLabelFontSize?: number;
+  onImageUpdate?: (imageData: string) => void;
+  showDataLabels?: boolean;
+  pointImages?: { [key: string]: string };
+  isDarkMode?: boolean;
+  imageWidth?: number;
+  imageHeight?: number;
+  pointSize?: number;
+  rotation?: number;
+  showTooltip?: boolean;
+  triggerShake?: boolean;
+}
+
+const ScatterPlotChart: React.FC<ScatterPlotChartProps> = ({
+  data,
+  xAxisLabel: _xAxisLabel,
+  zAxisLabel: _zAxisLabel,
+  visibleSeries = new Set(['Cyan', 'Blue', 'White', 'Red', 'Magenta', 'Green', 'Yellow', 'Black']) as Set<SeriesType>,
+  backgroundImage,
+  backgroundImageOpacity = 0.5,
+  backgroundImageScale = 1,
+  axisLabelFontSize: _axisLabelFontSize,
+  axisTickFontSize: _axisTickFontSize,
+  dataLabelFontSize = 10,
+  showDataLabels = false,
+  pointImages = {},
+  isDarkMode = false,
+  imageWidth = 530,
+  imageHeight = 534,
+  pointSize = 6,
+  rotation = 0,
+  showTooltip = true
+})
+}): JSX.Element => {
+  // State for tooltip position and content
+  const [tooltipVisible, setTooltipVisible] = useState(false);
+  const [tooltipContent, setTooltipContent] = useState<React.ReactNode>('');
+  const [tooltipPosition, setTooltipPosition] = useState({ x: 0, y: 0 });
+  const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Memoize the filtered data to prevent unnecessary recalculations
+  const filteredData = useMemo(() => {
+    console.log('[ScatterPlotChart] Raw data:', data);
+    const mappedData = data.filter((point: DataPoint) => visibleSeries.has(point.series as SeriesType))
+      .map((point: DataPoint): DataPoint => ({
+        ...point,
+        x: Math.max(-160, Math.min(160, point.x)),
+        z: Math.max(-160, Math.min(160, point.z))
+      }));
+    console.log('[ScatterPlotChart] filteredData (mapped):', mappedData);
+    return mappedData;
+  }, [data, visibleSeries]);
+
+  // Memoize dimensions for scales and container
+  const { chartWidth, chartHeight } = useMemo(() => {
+    const MAX_WIDTH = 800;
+    const MAX_HEIGHT = 700;
+    const aspectRatio = imageWidth / imageHeight;
+    let finalWidth = imageWidth;
+    let finalHeight = imageHeight;
+    if (finalWidth > MAX_WIDTH) {
+      finalWidth = MAX_WIDTH;
+      finalHeight = finalWidth / aspectRatio;
+    }
+    if (finalHeight > MAX_HEIGHT) {
+      finalHeight = MAX_HEIGHT;
+      finalWidth = finalHeight * aspectRatio;
+    }
+    console.log('[ScatterPlotChart] Calculated container dimensions - Width:', finalWidth, 'Height:', finalHeight);
+    return { chartWidth: finalWidth, chartHeight: finalHeight };
+  }, [imageWidth, imageHeight]);
+
+  // Memoize scales
+  const xScale = useMemo(() => {
+    return d3.scaleLinear()
+      .domain([-160, 160])
+      .range([-chartWidth / 2, chartWidth / 2]);
+  }, [chartWidth]);
+
+  const yScale = useMemo(() => {
+    return d3.scaleLinear()
+      .domain([-160, 160]) // Assuming z-axis maps to y-axis for the plot
+      .range([chartHeight / 2, -chartHeight / 2]); // Typical D3 y-scale (origin bottom-left means larger Z is higher Y)
+  }, [chartHeight]);
+
+  // Use the useLabelPlacements hook to get label positions
+  const labels = useLabelPlacements({
+    pointsToLabel: filteredData.map(d => ({
+      x: d.x, // Pass data coordinate
+      y: d.z, // Pass data coordinate (using z as y for the 2D plot)
+      label: String(d.id || ''), 
+      series: d.series as SeriesType,
+      originalDataPoint: d
+    })),
+    allPointsOnChart: filteredData.map(d => ({
+      x: d.x, // Pass data coordinate
+      y: d.z, // Pass data coordinate
+      label: String(d.id || ''),
+      series: d.series as SeriesType,
+      originalDataPoint: d
+    })),
+    containerWidth: chartWidth,
+    containerHeight: chartHeight,
+    fontSize: dataLabelFontSize,
+    pointMarkerSize: pointSize,
+    padding: 5, // This padding is used by useLabelPlacements for its internal scales
+    chartXDomain: [-160, 160], // Explicitly pass chart domains
+    chartYDomain: [-160, 160], // Explicitly pass chart domains
+  });
+
+  useEffect(() => {
+    if (!svgRef.current || !containerRef.current) return;
+
+    // Clear previous chart
+    d3.select(svgRef.current).selectAll('*').remove();
+
+    // SVG setup using memoized dimensions and scales
+    const svg = d3.select(svgRef.current)
+      .attr('width', chartWidth)
+      .attr('height', chartHeight)
+      .append('g')
+      .attr('transform', `translate(${chartWidth / 2},${chartHeight / 2})`); // Centering transforms down
+
+    // Add background image if provided
+    if (backgroundImage) {
+      // Create a separate group for the background image that doesn't rotate
+      svg.append('g')
+        .attr('class', 'background-image-container')
+        .append('image')
+        .attr('x', -chartWidth/2)
+        .attr('y', -chartHeight/2)
+        .attr('width', chartWidth)
+        .attr('height', chartHeight)
+        .attr('href', backgroundImage)
+        .attr('opacity', backgroundImageOpacity)
+        .attr('transform', `scale(${backgroundImageScale})`);
+    }
+
+    // Group data by series for efficient rendering
+    const seriesGroups = d3.group(filteredData, d => d.series);
+    
+    // Create a group that will be rotated
+    const rotationGroup = svg.append('g')
+      .attr('class', 'rotation-group')
+      .attr('transform', `rotate(${rotation})`);
+      
+    // Create point groups for each data point within the rotation group
+    const pointGroups = rotationGroup.selectAll<SVGGElement, DataPoint>('.point-group')
+      .data(filteredData)
+      .join('g')
+      .attr('class', 'point-group')
+      .attr('transform', (d: DataPoint) => {
+        const x = xScale(d.x);
+        const y = yScale(d.z);
+        return `translate(${x},${y})`;
+      });
+      
+    // Add a small delay to each point's shake animation for a wave effect
+    if (rotation === 0) {
+      pointGroups.each(function(_, i) {
+        d3.select(this).style('animation-delay', `${i * 0.05}s`);
+      });
+    }
+
+    // For each series, apply the appropriate styling
+    seriesGroups.forEach((_points, series) => {
+      // Select all points for this series
+      const seriesPoints = pointGroups.filter((d: DataPoint) => d.series === series);
+      
+      // Add circles for each point
+      seriesPoints.append('circle')
+        .attr('r', pointSize)
+        .attr('fill', (d: DataPoint) => SERIES_COLORS[d.series] || '#ccc')
+        .attr('stroke', series === 'Black' ? '#666666' : (isDarkMode ? '#FFFFFF' : '#000000'))
+        .attr('stroke-width', series === 'Black' ? 2 : 1)
+        .attr('cursor', 'pointer');
+
+      // Use custom point images if needed
+      if (pointImages[series]) {
+        seriesPoints.append('image')
+          .attr('href', pointImages[series])
+          .attr('width', pointSize * 2)
+          .attr('height', pointSize * 2)
+          .attr('x', -pointSize)
+          .attr('y', -pointSize)
+        
+        // Reset size and position
+        group
+          .transition()
+          .duration(150)
+          .ease(d3.easeQuadOut)
+          .attr('transform', `translate(${x},${y})`);
+
+        // Reset point style
+        group.select('circle')
+          .transition()
+          .duration(150)
+          .attr('stroke-width', d.series === 'Black' ? 2 : 1)
+          .attr('stroke', d.series === 'Black' ? '#666666' : (isDarkMode ? '#FFFFFF' : '#000000'));
+
+        // Hide tooltip immediately when mouse leaves the point
+        // Use requestAnimationFrame to ensure smooth transition
+        requestAnimationFrame(() => {
+          setTooltipVisible(false);
+        });
+      })
+      .on('mousemove', function(event: MouseEvent) {
+        if (showTooltip && tooltipVisible) {
+          const mouseX = event.pageX;
+          const mouseY = event.pageY;
+          const tooltipOffsetY = 30;
+          setTooltipPosition({
+            x: mouseX,
+            y: mouseY - tooltipOffsetY
+          });
+        }
+      });
+
+    // --- LABEL RENDERING (using finalLabels from the hook) ---
+    svg.selectAll('.data-labels-group').remove(); // Clear previous labels first
+    // --- RENDER LABELS ---
+    if (showDataLabels && labels.length > 0) {
+      console.log('[ScatterPlotChart] Rendering', labels.length, 'labels');
+      
+      // Add a group for all labels
+      const labelGroup = svg.append('g')
+        .attr('class', 'data-labels');
+      
+      // Add connecting lines and labels for each point
+      labelGroup.selectAll<SVGGElement, HookPlacedLabelInfo>('g.label-group')
+        .data(labels, (d: HookPlacedLabelInfo) => d.text)
+        .join('g')
+        .attr('class', 'label-group')
+        .each(function(d) {
+          const group = d3.select(this);
+          const point = d.originalDataPoint;
+          const pointX = xScale(Number(point.x));
+          const pointY = yScale(Number(point.z));
+          const labelColor = d.color || (isDarkMode ? '#FFFFFF' : '#000000');
+          
+          // Add connecting line
+          group.append('line')
+            .attr('class', 'label-connector')
+            .attr('x1', pointX)
+            .attr('y1', pointY)
+            .attr('x2', d.x)
+            .attr('y2', d.y)
+            .attr('stroke', labelColor)
+            .attr('stroke-width', 0.5)
+            .attr('stroke-dasharray', '2,2')
+            .attr('opacity', 0.7);
+            
+          // Add label text with minimal styling - only the point color
+          group.append('text')
+            .attr('class', 'data-label')
+            .attr('x', d.x)
+            .attr('y', d.y)
+            .attr('dy', '0.35em')
+            .attr('text-anchor', 'middle')
+            .style('fill', labelColor)
+            .style('font-size', `${dataLabelFontSize}px`)
+            .style('pointer-events', 'none')
+            .text(d.text);
+            
+          // Add hover effects
+          group.on('mouseover', function() {
+            d3.select(this).select('.label-connector')
+              .attr('stroke-width', 1.5)
+              .attr('opacity', 1);
+              
+            // Highlight corresponding point
+            d3.select(`#point-${point.id || ''}`)
+              .attr('r', pointSize + 2)
+              .attr('opacity', 1);
+          })
+          .on('mouseout', function() {
+            d3.select(this).select('.label-connector')
+              .attr('stroke-width', 0.5)
+              .attr('opacity', 0.7);
+              
+            // Reset point highlight
+            d3.select(`#point-${point.id || ''}`)
+              .attr('r', pointSize)
+              .attr('opacity', 0.9);
+          });
+        });
+    }
+    // --- END LABEL RENDERING ---
+
+  // Use a ref to track the previous labels to prevent unnecessary re-renders
+  const prevLabelsRef = useRef<HookPlacedLabelInfo[]>([]);
+  
+  // Only update the chart when the labels actually change
+  const labelsChanged = useMemo(() => {
+    if (labels.length !== prevLabelsRef.current.length) return true;
+    return labels.some((label, i) => {
+      const prevLabel = prevLabelsRef.current[i];
+      if (!prevLabel) return true;
+      return (
+        label.x !== prevLabel.x ||
+        label.y !== prevLabel.y ||
+        label.width !== prevLabel.width ||
+        label.height !== prevLabel.height ||
+        label.text !== prevLabel.text ||
+        label.color !== prevLabel.color
+      );
+    });
+  }, [labels]);
+
+  // Store the current labels in the ref for the next render
+  useEffect(() => {
+    if (labelsChanged) {
+      prevLabelsRef.current = labels;
+    }
+  }, [labels, labelsChanged]);
+
+  // Main effect for D3 rendering
+  useEffect(() => {
+    if (!svgRef.current || !containerRef.current) return;
+
+    // Clear previous chart
+    d3.select(svgRef.current).selectAll('*').remove();
+
+    // Only proceed with rendering if we have data and labels haven't changed
+    if (!labelsChanged) return;
+    
+    // D3 rendering code
+    const svgSelection = d3.select(svgRef.current)
+      .attr('width', chartWidth)
+      .attr('height', chartHeight);
+      
+    // Create a group for the chart content
+    const chartGroup = svgSelection.append('g')
+      .attr('transform', `translate(${chartWidth / 2},${chartHeight / 2})`);
+
+    // Add your D3 rendering logic here
+    console.log('Rendering chart with', filteredData.length, 'points');
+    
+    // Add points to the chart
+    chartGroup.selectAll('circle')
+      .data(filteredData as ExtendedDataPoint[])
+      .enter()
+      .append('circle')
+      .attr('cx', (d: ExtendedDataPoint) => xScale(d.x) || 0)
+      .attr('cy', (d: ExtendedDataPoint) => yScale(d.z) || 0)
+      .attr('r', pointSize)
+      .attr('fill', (d: ExtendedDataPoint) => d.color || '#000000')
+      .attr('opacity', 0.8);
+    
+  }, [chartWidth, chartHeight, labelsChanged, isDarkMode, pointSize, rotation, showDataLabels, dataLabelFontSize, filteredData]);
+
+  // Handle mouse leaving the chart container
+  const handleContainerMouseLeave = useCallback((): void => {
+    setTooltipVisible(false);
+  }, []);
+
+  // Render the chart container and SVG
+  return (
+    <div 
+      ref={containerRef}
+      className={`w-full h-full flex flex-col ${isDarkMode ? 'bg-gray-900 text-white' : 'bg-white text-black'}`}
+      onMouseLeave={handleContainerMouseLeave}
+    >
+      <div 
+        className="w-full flex-grow relative flex items-center justify-center p-0"
+        style={{
+          width: '100%',
+          height: '100%',
+          maxWidth: '800px',
+          maxHeight: '700px',
+          overflow: 'hidden',
+          padding: 0,
+          margin: '0 auto',
+          position: 'relative'
+        }}
+      >
+        <svg 
+          ref={svgRef} 
+          className="w-full h-full"
+          viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+          preserveAspectRatio="xMidYMid meet"
+        />
+        
+        {/* Tooltip */}
+        {showTooltip && tooltipVisible && (
+          <div
+            className="pointer-events-none absolute px-2 py-1 text-[11px] text-white bg-black/80 border border-white/20 rounded flex items-start shadow-lg"
+            style={{
+              position: 'fixed',
+              left: `${tooltipPosition.x}px`,
+              top: `${tooltipPosition.y - 10}px`,
+              transform: 'translate(-50%, -100%)',
+              zIndex: 1000,
+              pointerEvents: 'none',
+              minWidth: '70px',
+              padding: '4px 6px'
+            }}
+          >
+            {tooltipContent}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Export the memoized component as default
+export default React.memo(ScatterPlotChart);
